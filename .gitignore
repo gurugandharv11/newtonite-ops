@@ -53,3 +53,7 @@ dist-ssr/
 *.sw?
 .DS_Store
 Thumbs.db
+
+# Local Runtime Databases
+backend/data/
+data/
