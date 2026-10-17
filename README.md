@@ -108,8 +108,11 @@ From the root directory:
 ```bash
 cd backend
 
-# Compile and run Spring Boot application
+# Option 1: Run with default zero-config embedded H2 in MySQL mode
 mvn spring-boot:run
+
+# Option 2: Run with Docker or Local MySQL 8.0 (after running docker compose up -d)
+mvn spring-boot:run -Dspring-boot.run.profiles=mysql
 ```
 *The backend starts at `http://localhost:8080`. Flyway automatically executes database migrations (`V1` and `V2`) on startup.*
 
