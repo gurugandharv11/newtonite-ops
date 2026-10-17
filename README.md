@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Newtonite Operations Under Pressure — Work Management Platform
 
 A high-reliability, full-stack enterprise work management platform built for the **Newtonite Software Engineering Assessment**. Designed for operational teams triaging high-stakes production incidents, engineering problems, customer escalations, payment investigations, and compliance requests.
@@ -181,3 +182,6 @@ mvn test
    - Changes are currently propagated via TanStack Query invalidation and polling. In a live command center with hundreds of concurrent triage operators, a STOMP/WebSocket or SSE channel could be added to broadcast state transitions in real time.
 3. **Idempotency Key TTL**:
    - Currently, idempotency records are stored permanently in MySQL. In production, a scheduled cron or partitioning scheme can prune keys older than 30 days.
+=======
+# newtonite-ops
+>>>>>>> aea3874f3b4dd7c10008ed754bfba4b45721af76
