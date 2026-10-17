@@ -100,13 +100,28 @@ public class NewtoniteOpsIntegrationTests {
                 .andExpect(jsonPath("$.code").value("FORBIDDEN"));
     }
 
-    // TEST 3: Resource-level authorization - User from another team cannot access restricted items
+    // TEST 3: Resource-level authorization - User from another team cannot access or modify restricted items
     @Test
     @DisplayName("3. Resource Authorization: Cross-team user cannot access unauthorized team item (403 Forbidden)")
     void testCrossTeamAccessRejected() throws Exception {
         // Work item 4 belongs to Team 2 (Payment). Elena belongs only to Team 1 and 3.
         mockMvc.perform(get("/api/items/4")
                         .header("Authorization", "Bearer " + viewerToken))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.code").value("FORBIDDEN"));
+
+        // Activity timeline read denial
+        mockMvc.perform(get("/api/items/4/activity")
+                        .header("Authorization", "Bearer " + viewerToken))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.code").value("FORBIDDEN"));
+
+        // Mutation denial on cross-team work item
+        TransitionRequest transReq = new TransitionRequest(WorkItemStatus.IN_PROGRESS, "Unauthorized transition");
+        mockMvc.perform(post("/api/items/4/transition")
+                        .header("Authorization", "Bearer " + viewerToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(transReq)))
                 .andExpect(status().isForbidden())
                 .andExpect(jsonPath("$.code").value("FORBIDDEN"));
     }
@@ -122,7 +137,7 @@ public class NewtoniteOpsIntegrationTests {
                 .andReturn();
         WorkItemResponse current = objectMapper.readValue(readResult.getResponse().getContentAsString(), WorkItemResponse.class);
 
-        // Update with stale version (current.version() - 1 or 9999L)
+        // Update with stale version
         UpdateWorkItemRequest staleReq = new UpdateWorkItemRequest(
                 999L,
                 current.title(),
@@ -181,7 +196,7 @@ public class NewtoniteOpsIntegrationTests {
 
         long countAfter = workItemRepository.count();
 
-        assertThat(countAfter).isEqualTo(countBefore + 1); // Only 1 entity created in database!
+        assertThat(countAfter).isEqualTo(countBefore + 1); // Only 1 entity created in database
         assertThat(firstResponse.id()).isEqualTo(secondResponse.id());
     }
 
@@ -316,5 +331,74 @@ public class NewtoniteOpsIntegrationTests {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.content").isArray())
                 .andExpect(jsonPath("$.content[0].actionType").value("COMMENT_ADDED"));
+    }
+
+    // TEST 11: Idempotency Key Reuse Conflict - Same key with modified payload must be rejected with 409 Conflict
+    @Test
+    @DisplayName("11. Idempotency Key Reuse Conflict: Same key with different payload is rejected (409 Conflict)")
+    void testIdempotencyKeyReuseWithDifferentPayload() throws Exception {
+        String reuseKey = "conflict-idem-key-" + System.currentTimeMillis();
+        CreateWorkItemRequest req1 = new CreateWorkItemRequest(
+                "Original Payload Incident",
+                "Description A",
+                WorkItemType.CUSTOMER_ISSUE,
+                Priority.LOW,
+                1L,
+                null,
+                null
+        );
+
+        mockMvc.perform(post("/api/items")
+                        .header("Authorization", "Bearer " + memberToken)
+                        .header("Idempotency-Key", reuseKey)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(req1)))
+                .andExpect(status().isCreated());
+
+        // Alter payload with same key
+        CreateWorkItemRequest req2 = new CreateWorkItemRequest(
+                "Tampered Payload Incident",
+                "Description B altered",
+                WorkItemType.PRODUCTION_INCIDENT,
+                Priority.URGENT,
+                1L,
+                null,
+                null
+        );
+
+        mockMvc.perform(post("/api/items")
+                        .header("Authorization", "Bearer " + memberToken)
+                        .header("Idempotency-Key", reuseKey)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(req2)))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("CONFLICT"));
+    }
+
+    // TEST 12: Transactional Audit Rollback - When item update fails validation, activity event is NOT committed
+    @Test
+    @DisplayName("12. Transactional Audit Integrity: Failed mutation rolls back activity events atomically")
+    void testTransactionalRollbackOnFailure() throws Exception {
+        long eventsCountBefore = activityEventRepository.count();
+
+        // Attempt invalid update with blank title
+        UpdateWorkItemRequest badReq = new UpdateWorkItemRequest(
+                0L,
+                "", // Blank title will fail Bean Validation
+                "Some desc",
+                Priority.LOW,
+                null,
+                null
+        );
+
+        mockMvc.perform(patch("/api/items/2")
+                        .header("Authorization", "Bearer " + leadToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(badReq)))
+                .andExpect(status().isBadRequest());
+
+        long eventsCountAfter = activityEventRepository.count();
+        // Assert zero orphan activity events committed
+        assertThat(eventsCountAfter).isEqualTo(eventsCountBefore);
     }
 }

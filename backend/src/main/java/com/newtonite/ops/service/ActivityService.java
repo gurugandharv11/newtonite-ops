@@ -8,6 +8,8 @@ import com.newtonite.ops.model.ActivityEvent;
 import com.newtonite.ops.model.User;
 import com.newtonite.ops.model.WorkItem;
 import com.newtonite.ops.repository.ActivityEventRepository;
+import com.newtonite.ops.repository.WorkItemRepository;
+import com.newtonite.ops.service.AuthorizationService;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
@@ -20,9 +22,15 @@ import java.util.List;
 public class ActivityService {
 
     private final ActivityEventRepository activityEventRepository;
+    private final WorkItemRepository workItemRepository;
+    private final AuthorizationService authService;
 
-    public ActivityService(ActivityEventRepository activityEventRepository) {
+    public ActivityService(ActivityEventRepository activityEventRepository,
+                           WorkItemRepository workItemRepository,
+                           AuthorizationService authService) {
         this.activityEventRepository = activityEventRepository;
+        this.workItemRepository = workItemRepository;
+        this.authService = authService;
     }
 
     /**
@@ -38,12 +46,20 @@ public class ActivityService {
 
     @Transactional(readOnly = true)
     public PageResponse<ActivityEventResponse> getWorkItemActivityPaged(Long workItemId, Pageable pageable) {
+        WorkItem item = workItemRepository.findById(workItemId)
+                .orElseThrow(() -> new com.newtonite.ops.exception.ResourceNotFoundException("Work item not found: " + workItemId));
+        authService.checkRoleInTeam(item.getTeam().getId(), com.newtonite.ops.model.TeamRole.VIEWER);
+
         Page<ActivityEvent> page = activityEventRepository.findByWorkItemIdWithActorPaged(workItemId, pageable);
         return PageResponse.of(page.map(this::mapToResponse));
     }
 
     @Transactional(readOnly = true)
     public List<ActivityEventResponse> getWorkItemActivity(Long workItemId) {
+        WorkItem item = workItemRepository.findById(workItemId)
+                .orElseThrow(() -> new com.newtonite.ops.exception.ResourceNotFoundException("Work item not found: " + workItemId));
+        authService.checkRoleInTeam(item.getTeam().getId(), com.newtonite.ops.model.TeamRole.VIEWER);
+
         return activityEventRepository.findByWorkItemIdWithActor(workItemId).stream()
                 .map(this::mapToResponse)
                 .toList();
