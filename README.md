@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Newtonite Operations Under Pressure — Work Management Platform
 
 A high-reliability, full-stack enterprise work management platform built for the **Newtonite Software Engineering Assessment**. Designed for operational teams triaging high-stakes production incidents, engineering problems, customer escalations, payment investigations, and compliance requests.
@@ -34,7 +33,7 @@ A high-reliability, full-stack enterprise work management platform built for the
                                     v
 +-------------------------------------------------------------------------+
 |                                DATABASE                                 |
-|   MySQL 8.0 (Flyway Database Migrations)                                |
+|   MySQL 8.0 / Embedded H2 Mode (Flyway Database Migrations)             |
 |   - V1__initial_schema.sql (Normalized schema, FKs, constraints, indexes)|
 |   - V2__seed_demo_data.sql (Multi-team seed data, roles, items, history)|
 +-------------------------------------------------------------------------+
@@ -92,8 +91,8 @@ All demo accounts use password: `password123`
 ### Prerequisites
 - **Java 21 JDK**
 - **Node.js 18+ & npm**
-- **Maven 3.9+** (or using bundled wrapper)
-- **MySQL 8.0** or **Docker Compose**
+- **Maven 3.9+** (or bundled environment tools)
+- **MySQL 8.0** or **Docker Compose** (or run zero-config using the embedded H2 database file)
 
 ### Option A: Using Docker for MySQL
 ```bash
@@ -131,14 +130,15 @@ npm run dev
 
 ## 5. Running Automated Tests
 
-A comprehensive suite of 10 automated integration tests verifies the entire system against concurrency, security, and idempotency edge cases:
+### Backend Integration Tests (12/12 Passing)
+A comprehensive suite of 12 automated integration tests verifies the entire system against concurrency, security, transactions, and idempotency edge cases:
 
 ```bash
 cd backend
 mvn test
 ```
 
-### Executed Tests Summary:
+#### Executed Tests Summary:
 1. `testInvalidTransitionRejected`: Verifies illegal FSM status skips (e.g. `OPEN` &rarr; `CLOSED`) return `400 Bad Request`.
 2. `testNonLeadCannotApprove`: Verifies regular team members cannot approve items awaiting approval (`403 Forbidden`).
 3. `testCrossTeamAccessRejected`: Verifies users from other teams cannot view or mutate restricted items (`403 Forbidden`).
@@ -149,6 +149,16 @@ mvn test
 8. `testPaginationAndFiltering`: Verifies server-side search, status filters, and page boundaries.
 9. `testDashboardSummary`: Verifies dashboard counts are correctly scoped to user permissions.
 10. `testCommentsAndTimeline`: Verifies comments and audit events are appended and ordered chronologically.
+11. `testIdempotencyKeyReuseWithDifferentPayload`: Verifies attempting to reuse an existing idempotency key with a mutated payload returns `409 Conflict`.
+12. `testTransactionalRollbackOnFailure`: Verifies failures during item updates trigger an atomic rollback, ensuring no partial state or detached activity events persist.
+
+### Frontend Unit & Component Tests (2/2 Passing)
+Frontend tests verify component rendering and error states:
+
+```bash
+cd frontend
+npm test
+```
 
 ---
 
@@ -177,11 +187,8 @@ mvn test
 ## 7. Known Limitations & Production Enhancements
 
 1. **Activity Log Archival**:
-   - The current append-only activity ledger stores all historical actions in relational MySQL. In extreme enterprise scales (100M+ events), older completed items should be archived to columnar storage (ClickHouse or AWS Athena/S3).
+   - The current append-only activity ledger stores all historical actions in relational MySQL / H2. In extreme enterprise scales (100M+ events), older completed items should be archived to columnar storage (ClickHouse or AWS Athena/S3).
 2. **WebSocket Live Updates**:
    - Changes are currently propagated via TanStack Query invalidation and polling. In a live command center with hundreds of concurrent triage operators, a STOMP/WebSocket or SSE channel could be added to broadcast state transitions in real time.
 3. **Idempotency Key TTL**:
-   - Currently, idempotency records are stored permanently in MySQL. In production, a scheduled cron or partitioning scheme can prune keys older than 30 days.
-=======
-# newtonite-ops
->>>>>>> aea3874f3b4dd7c10008ed754bfba4b45721af76
+   - Currently, idempotency records are stored permanently. In production, a scheduled cron or partitioning scheme can prune keys older than 30 days.
