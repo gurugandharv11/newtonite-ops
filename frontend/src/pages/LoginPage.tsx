@@ -24,6 +24,8 @@ export const LoginPage: React.FC = () => {
         setError('Cannot connect to backend server. Please verify the backend is running on port 8080.');
       } else if (err.response.status === 401) {
         setError(err.response.data?.message || 'Invalid username or password');
+      } else if ([502, 503, 504].includes(err.response.status)) {
+        setError('Backend server is offline or unreachable on port 8080. Please start the backend with: cd backend && mvn spring-boot:run');
       } else {
         setError(err.response.data?.message || `Server error (${err.response.status}). Please try again later.`);
       }
