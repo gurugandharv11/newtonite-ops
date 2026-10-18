@@ -27,7 +27,7 @@ public interface WorkItemRepository extends JpaRepository<WorkItem, Long>, JpaSp
      * Increments the version atomically and updates the timestamp.
      * Returns 1 if successful, 0 if already claimed by someone else.
      */
-    @Modifying
+    @Modifying(clearAutomatically = true)
     @Query("UPDATE WorkItem w SET w.assignee.id = :assigneeId, w.version = w.version + 1, w.updatedAt = :now " +
            "WHERE w.id = :itemId AND w.assignee IS NULL")
     int atomicClaim(@Param("itemId") Long itemId, @Param("assigneeId") Long assigneeId, @Param("now") java.time.Instant now);

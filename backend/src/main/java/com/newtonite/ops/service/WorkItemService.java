@@ -36,6 +36,7 @@ public class WorkItemService {
     private final WorkflowService workflowService;
     private final ActivityService activityService;
     private final IdempotencyService idempotencyService;
+    private final com.newtonite.ops.repository.OutboxEventRepository outboxEventRepository;
     private final ObjectMapper objectMapper;
 
     public WorkItemService(WorkItemRepository workItemRepository,
@@ -45,6 +46,7 @@ public class WorkItemService {
                            WorkflowService workflowService,
                            ActivityService activityService,
                            IdempotencyService idempotencyService,
+                           com.newtonite.ops.repository.OutboxEventRepository outboxEventRepository,
                            ObjectMapper objectMapper) {
         this.workItemRepository = workItemRepository;
         this.teamRepository = teamRepository;
@@ -53,6 +55,7 @@ public class WorkItemService {
         this.workflowService = workflowService;
         this.activityService = activityService;
         this.idempotencyService = idempotencyService;
+        this.outboxEventRepository = outboxEventRepository;
         this.objectMapper = objectMapper;
     }
 
@@ -63,10 +66,12 @@ public class WorkItemService {
     @Transactional
     public WorkItemResponse createWorkItem(CreateWorkItemRequest request, String idempotencyKey) {
         String payloadHash = idempotencyService.computePayloadHash(request);
+        Long currentUserId = authService.getCurrentUserId();
+        String scopedKey = idempotencyService.buildScopedKey(currentUserId, idempotencyKey);
 
-        // Check if an idempotency record exists
-        if (idempotencyKey != null && !idempotencyKey.isBlank()) {
-            Optional<IdempotencyRecord> existingRecord = idempotencyService.findRecord(idempotencyKey);
+        // Check if an idempotency record exists for this authenticated user
+        if (scopedKey != null) {
+            Optional<IdempotencyRecord> existingRecord = idempotencyService.findRecord(scopedKey);
             if (existingRecord.isPresent()) {
                 idempotencyService.validateReplay(existingRecord.get(), payloadHash);
                 try {
@@ -83,7 +88,7 @@ public class WorkItemService {
         Team team = teamRepository.findById(request.teamId())
                 .orElseThrow(() -> new ResourceNotFoundException("Team not found: " + request.teamId()));
 
-        User creator = userRepository.findById(authService.getCurrentUserId())
+        User creator = userRepository.findById(currentUserId)
                 .orElseThrow(() -> new ResourceNotFoundException("User not found"));
 
         User assignee = null;
@@ -131,11 +136,17 @@ public class WorkItemService {
             );
         }
 
+        // Record transactional outbox event for async notifications
+        outboxEventRepository.save(new com.newtonite.ops.model.OutboxEvent(
+                "WORK_ITEM", saved.getId(), "ITEM_CREATED",
+                "Work item created: " + saved.getTitle()
+        ));
+
         WorkItemResponse response = mapToResponse(saved);
 
         // Persist idempotency record in the same transaction
-        if (idempotencyKey != null && !idempotencyKey.isBlank()) {
-            idempotencyService.saveRecord(idempotencyKey, payloadHash, 201, response);
+        if (scopedKey != null) {
+            idempotencyService.saveRecord(scopedKey, payloadHash, 201, response);
         }
 
         return response;
@@ -243,17 +254,27 @@ public class WorkItemService {
                 .orElseThrow(() -> new ResourceNotFoundException("User not found"));
 
         if (item.getAssignee() != null) {
+            if (item.getAssignee().getId().equals(currentUserId)) {
+                // Idempotent same-user claim retry: return existing state without duplicate activity logs
+                return mapToResponse(item);
+            }
             throw new ConflictException("Item is already assigned to " + item.getAssignee().getFullName());
         }
 
         // Execute atomic database query
         int updatedRows = workItemRepository.atomicClaim(id, currentUserId, Instant.now());
         if (updatedRows == 0) {
+            // Check if current user won the claim race concurrently
+            WorkItem current = workItemRepository.findByIdWithDetails(id).orElseThrow();
+            if (current.getAssignee() != null && current.getAssignee().getId().equals(currentUserId)) {
+                return mapToResponse(current);
+            }
             throw new ConflictException("Claim conflict: Another team member claimed this work item concurrently.");
         }
 
         // Refresh and record activity event in same transaction
         WorkItem refreshed = workItemRepository.findByIdWithDetails(id).orElseThrow();
+        refreshed.setAssignee(currentUser);
         activityService.recordEvent(
                 refreshed,
                 currentUser,
@@ -263,11 +284,17 @@ public class WorkItemService {
                 currentUser.getFullName() + " claimed this work item"
         );
 
+        // Record outbox event for asynchronous notification processing
+        outboxEventRepository.save(new com.newtonite.ops.model.OutboxEvent(
+                "WORK_ITEM", refreshed.getId(), "ITEM_CLAIMED",
+                currentUser.getFullName() + " claimed work item: " + refreshed.getTitle()
+        ));
+
         return mapToResponse(refreshed);
     }
 
     /**
-     * State machine status transition with workflow rules and role authorization checks.
+     * State machine status transition with workflow rules, role authorization, and OCC version checks.
      */
     @Transactional
     public WorkItemResponse transitionWorkItem(Long id, TransitionRequest request) {
@@ -276,6 +303,12 @@ public class WorkItemService {
 
         // Enforce team membership: at least MEMBER
         authService.checkRoleInTeam(item.getTeam().getId(), TeamRole.MEMBER);
+
+        // Optimistic locking check if version was provided by client
+        if (request.version() != null && !Objects.equals(item.getVersion(), request.version())) {
+            throw new ConflictException("Stale update conflict: The item has been modified by another transaction. " +
+                    "Your version: " + request.version() + ", Current version: " + item.getVersion());
+        }
 
         // Validate workflow transition rules and approval segregation
         workflowService.validateTransition(item, request.targetStatus());
@@ -303,6 +336,13 @@ public class WorkItemService {
         activityService.recordEvent(item, currentUser, actionType, oldStatus.name(), newStatus.name(), msg);
 
         WorkItem updated = workItemRepository.save(item);
+
+        // Record outbox event for asynchronous notification processing
+        outboxEventRepository.save(new com.newtonite.ops.model.OutboxEvent(
+                "WORK_ITEM", updated.getId(), actionType.name(),
+                "Status transitioned from " + oldStatus + " to " + newStatus
+        ));
+
         return mapToResponse(updated);
     }
 

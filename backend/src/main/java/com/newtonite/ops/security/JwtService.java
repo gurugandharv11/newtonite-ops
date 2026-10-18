@@ -21,7 +21,13 @@ public class JwtService {
 
     public JwtService(
             @Value("${app.jwt.secret:404E635266556A586E3272357538782F413F4428472B4B6250645367566B5970}") String secret,
-            @Value("${app.jwt.expiration-hours:24}") long expirationHours) {
+            @Value("${app.jwt.expiration-hours:24}") long expirationHours,
+            @Value("${spring.profiles.active:default}") String activeProfile) {
+        if ("prod".equalsIgnoreCase(activeProfile) || "production".equalsIgnoreCase(activeProfile)) {
+            if ("404E635266556A586E3272357538782F413F4428472B4B6250645367566B5970".equals(secret)) {
+                throw new IllegalStateException("FATAL: Production mode detected but using hardcoded default JWT secret. Set JWT_SECRET environment variable.");
+            }
+        }
         this.signingKey = Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
         this.expirationHours = expirationHours;
     }

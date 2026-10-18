@@ -54,8 +54,14 @@ public class WorkItemDtos {
         @NotNull(message = "Target status is required")
         WorkItemStatus targetStatus,
 
-        String comment
-    ) {}
+        String comment,
+
+        Long version
+    ) {
+        public TransitionRequest(WorkItemStatus targetStatus, String comment) {
+            this(targetStatus, comment, null);
+        }
+    }
 
     public record WorkItemResponse(
         Long id,

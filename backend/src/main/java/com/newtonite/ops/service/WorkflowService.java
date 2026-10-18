@@ -57,10 +57,15 @@ public class WorkflowService {
                 throw new ForbiddenException("Only team Leads or Administrators can approve and resolve items awaiting approval.");
             }
 
-            // Self-approval restriction: A creator/assignee cannot approve their own work item unless Global Admin
+            // Self-approval restriction: Neither an assignee nor a creator can approve their own work item unless Global Admin
             Long currentUserId = authService.getCurrentUserId();
-            if (!authService.isGlobalAdmin() && item.getAssignee() != null && item.getAssignee().getId().equals(currentUserId)) {
-                throw new ForbiddenException("Segregation of duties violation: An assignee cannot approve their own item.");
+            if (!authService.isGlobalAdmin()) {
+                if (item.getAssignee() != null && item.getAssignee().getId().equals(currentUserId)) {
+                    throw new ForbiddenException("Segregation of duties violation: An assignee cannot approve their own item.");
+                }
+                if (item.getCreator() != null && item.getCreator().getId().equals(currentUserId)) {
+                    throw new ForbiddenException("Segregation of duties violation: A creator cannot approve their own item.");
+                }
             }
         }
 

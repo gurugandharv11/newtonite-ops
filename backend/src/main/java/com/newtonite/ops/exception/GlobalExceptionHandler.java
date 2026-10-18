@@ -41,9 +41,11 @@ public class GlobalExceptionHandler {
                 .body(new ApiErrorResponse("FORBIDDEN", ex.getMessage(), HttpStatus.FORBIDDEN.value()));
     }
 
-    @ExceptionHandler({ConflictException.class, OptimisticLockingFailureException.class, OptimisticLockException.class})
+    @ExceptionHandler({ConflictException.class, OptimisticLockingFailureException.class, OptimisticLockException.class, org.springframework.dao.DataIntegrityViolationException.class})
     public ResponseEntity<ApiErrorResponse> handleConflict(Exception ex) {
-        String msg = ex instanceof ConflictException ? ex.getMessage() : "The item has been modified by another transaction. Please refresh and review latest changes.";
+        String msg = ex instanceof ConflictException ? ex.getMessage() :
+                     ex instanceof org.springframework.dao.DataIntegrityViolationException ? "Conflicting concurrent request or duplicate resource key detected." :
+                     "The item has been modified by another transaction. Please refresh and review latest changes.";
         return ResponseEntity.status(HttpStatus.CONFLICT)
                 .body(new ApiErrorResponse("CONFLICT", msg, HttpStatus.CONFLICT.value()));
     }

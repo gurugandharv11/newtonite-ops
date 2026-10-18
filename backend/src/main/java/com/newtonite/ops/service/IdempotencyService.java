@@ -52,6 +52,13 @@ public class IdempotencyService {
         }
     }
 
+    public String buildScopedKey(Long userId, String rawKey) {
+        if (rawKey == null || rawKey.isBlank()) {
+            return null;
+        }
+        return "u:" + (userId != null ? userId : "anon") + ":" + rawKey.trim();
+    }
+
     @Transactional(propagation = Propagation.MANDATORY)
     public void saveRecord(String idempotencyKey, String requestHash, int status, Object responseBody) {
         if (idempotencyKey == null || idempotencyKey.isBlank()) {
@@ -60,7 +67,7 @@ public class IdempotencyService {
         try {
             String bodyJson = objectMapper.writeValueAsString(responseBody);
             IdempotencyRecord record = new IdempotencyRecord(idempotencyKey.trim(), requestHash, status, bodyJson);
-            idempotencyRecordRepository.save(record);
+            idempotencyRecordRepository.saveAndFlush(record);
         } catch (DataIntegrityViolationException e) {
             throw new ConflictException("Concurrent request with duplicate idempotency key detected.");
         } catch (Exception e) {

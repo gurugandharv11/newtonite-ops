@@ -48,6 +48,12 @@ public class NewtoniteOpsIntegrationTests {
     @Autowired
     private ActivityEventRepository activityEventRepository;
 
+    @Autowired
+    private com.newtonite.ops.repository.OutboxEventRepository outboxEventRepository;
+
+    @Autowired
+    private com.newtonite.ops.service.OutboxProcessor outboxProcessor;
+
     private String adminToken;
     private String leadToken;    // Sarah Connor (Team 1 Lead)
     private String memberToken;  // Alex Murphy (Team 1 Member)
@@ -400,5 +406,231 @@ public class NewtoniteOpsIntegrationTests {
         long eventsCountAfter = activityEventRepository.count();
         // Assert zero orphan activity events committed
         assertThat(eventsCountAfter).isEqualTo(eventsCountBefore);
+    }
+
+    // TEST 13: Same-User Claim Retry is Idempotent - does not duplicate activity events
+    @Test
+    @DisplayName("13. Claim Idempotency: Same-user claim retry returns item without duplicate activity event")
+    void testSameUserClaimRetryIsIdempotent() throws Exception {
+        // Create a new unassigned item to test claiming
+        CreateWorkItemRequest req = new CreateWorkItemRequest(
+                "Unassigned Ticket for Claim Test",
+                "Testing retry idempotency",
+                WorkItemType.GENERAL_TASK,
+                Priority.MEDIUM,
+                1L,
+                null,
+                null
+        );
+
+        MvcResult createResult = mockMvc.perform(post("/api/items")
+                        .header("Authorization", "Bearer " + memberToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(req)))
+                .andExpect(status().isCreated())
+                .andReturn();
+
+        WorkItemResponse created = objectMapper.readValue(createResult.getResponse().getContentAsString(), WorkItemResponse.class);
+        Long itemId = created.id();
+
+        // First claim by Alex Murphy (member)
+        mockMvc.perform(post("/api/items/" + itemId + "/claim")
+                        .header("Authorization", "Bearer " + memberToken))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.assignee.username").value("alex.member"));
+
+        long activityCountAfterFirstClaim = activityEventRepository.count();
+
+        // Second claim by same user (Alex Murphy) - should be idempotent
+        mockMvc.perform(post("/api/items/" + itemId + "/claim")
+                        .header("Authorization", "Bearer " + memberToken))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.assignee.username").value("alex.member"));
+
+        long activityCountAfterSecondClaim = activityEventRepository.count();
+        assertThat(activityCountAfterSecondClaim).isEqualTo(activityCountAfterFirstClaim);
+
+        // Claim by a different user (Sarah Connor) - should fail with 409 Conflict
+        mockMvc.perform(post("/api/items/" + itemId + "/claim")
+                        .header("Authorization", "Bearer " + leadToken))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("CONFLICT"));
+    }
+
+    // TEST 14: Creator Segregation of Duties - Creator cannot approve own work item
+    @Test
+    @DisplayName("14. Segregation of Duties: Creator cannot approve their own work item")
+    void testCreatorCannotSelfApprove() throws Exception {
+        // Sarah Connor (Lead) creates an item
+        CreateWorkItemRequest req = new CreateWorkItemRequest(
+                "Sarah Self-Created Feature",
+                "Needs sign-off",
+                WorkItemType.ENGINEERING_PROBLEM,
+                Priority.HIGH,
+                1L,
+                null,
+                null
+        );
+
+        MvcResult createResult = mockMvc.perform(post("/api/items")
+                        .header("Authorization", "Bearer " + leadToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(req)))
+                .andExpect(status().isCreated())
+                .andReturn();
+
+        WorkItemResponse created = objectMapper.readValue(createResult.getResponse().getContentAsString(), WorkItemResponse.class);
+        Long itemId = created.id();
+
+        // Transition to IN_PROGRESS
+        mockMvc.perform(post("/api/items/" + itemId + "/transition")
+                        .header("Authorization", "Bearer " + leadToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(new TransitionRequest(WorkItemStatus.IN_PROGRESS, "Starting work"))))
+                .andExpect(status().isOk());
+
+        // Transition to AWAITING_APPROVAL
+        mockMvc.perform(post("/api/items/" + itemId + "/transition")
+                        .header("Authorization", "Bearer " + leadToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(new TransitionRequest(WorkItemStatus.AWAITING_APPROVAL, "Ready for sign-off"))))
+                .andExpect(status().isOk());
+
+        // Sarah (Lead & Creator) attempts to approve her own work item -> 403 Forbidden
+        mockMvc.perform(post("/api/items/" + itemId + "/transition")
+                        .header("Authorization", "Bearer " + leadToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(new TransitionRequest(WorkItemStatus.RESOLVED, "Approving my own item"))))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.code").value("FORBIDDEN"));
+
+        // Global Admin CAN approve
+        mockMvc.perform(post("/api/items/" + itemId + "/transition")
+                        .header("Authorization", "Bearer " + adminToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(new TransitionRequest(WorkItemStatus.RESOLVED, "Admin approval permitted"))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("RESOLVED"));
+    }
+
+    // TEST 15: Transition Optimistic Concurrency Control (OCC)
+    @Test
+    @DisplayName("15. Transition OCC: Outdated version rejected with 409 Conflict")
+    void testTransitionChecksVersionOCC() throws Exception {
+        // Pass stale version (999L) to status transition
+        TransitionRequest staleTransition = new TransitionRequest(WorkItemStatus.OPEN, "Reverting", 999L);
+
+        mockMvc.perform(post("/api/items/1/transition")
+                        .header("Authorization", "Bearer " + leadToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(staleTransition)))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("CONFLICT"));
+    }
+
+    // TEST 16: Duplicate Transition Rejected
+    @Test
+    @DisplayName("16. Workflow Rules: Transitioning to the current status returns 400 Bad Request")
+    void testDuplicateTransitionRejected() throws Exception {
+        // Item 1 is currently IN_PROGRESS; attempting transition to IN_PROGRESS should fail
+        TransitionRequest dup = new TransitionRequest(WorkItemStatus.IN_PROGRESS, "No-op transition");
+
+        mockMvc.perform(post("/api/items/1/transition")
+                        .header("Authorization", "Bearer " + memberToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(dup)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("BAD_REQUEST"));
+    }
+
+    // TEST 17: User-Scoped Idempotency Key
+    @Test
+    @DisplayName("17. Idempotency Scoping: Identical key used by different users operates in separate namespaces")
+    void testIdempotencyKeyScopedToUser() throws Exception {
+        String sharedKey = "cross-user-scoped-key-999";
+
+        CreateWorkItemRequest req1 = new CreateWorkItemRequest(
+                "Alex User Item",
+                "Alex description",
+                WorkItemType.CUSTOMER_ISSUE,
+                Priority.LOW,
+                1L,
+                null,
+                null
+        );
+
+        CreateWorkItemRequest req2 = new CreateWorkItemRequest(
+                "Sarah User Item",
+                "Sarah description",
+                WorkItemType.GENERAL_TASK,
+                Priority.HIGH,
+                1L,
+                null,
+                null
+        );
+
+        // Alex creates with sharedKey
+        MvcResult res1 = mockMvc.perform(post("/api/items")
+                        .header("Authorization", "Bearer " + memberToken)
+                        .header("Idempotency-Key", sharedKey)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(req1)))
+                .andExpect(status().isCreated())
+                .andReturn();
+
+        // Sarah creates with same sharedKey but her own token and payload -> must succeed!
+        MvcResult res2 = mockMvc.perform(post("/api/items")
+                        .header("Authorization", "Bearer " + leadToken)
+                        .header("Idempotency-Key", sharedKey)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(req2)))
+                .andExpect(status().isCreated())
+                .andReturn();
+
+        WorkItemResponse item1 = objectMapper.readValue(res1.getResponse().getContentAsString(), WorkItemResponse.class);
+        WorkItemResponse item2 = objectMapper.readValue(res2.getResponse().getContentAsString(), WorkItemResponse.class);
+
+        assertThat(item1.id()).isNotEqualTo(item2.id());
+        assertThat(item1.title()).isEqualTo("Alex User Item");
+        assertThat(item2.title()).isEqualTo("Sarah User Item");
+    }
+
+    // TEST 18: Transactional Outbox Notification Flow
+    @Test
+    @DisplayName("18. Async Outbox: Transactional outbox event created and dispatched by processor")
+    void testTransactionalOutboxNotificationFlow() throws Exception {
+        long outboxCountBefore = outboxEventRepository.count();
+
+        CreateWorkItemRequest req = new CreateWorkItemRequest(
+                "Outbox Pipeline Verification Task",
+                "Verifying asynchronous outbox dispatch",
+                WorkItemType.GENERAL_TASK,
+                Priority.MEDIUM,
+                1L,
+                null,
+                null
+        );
+
+        MvcResult res = mockMvc.perform(post("/api/items")
+                        .header("Authorization", "Bearer " + memberToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(req)))
+                .andExpect(status().isCreated())
+                .andReturn();
+
+        WorkItemResponse created = objectMapper.readValue(res.getResponse().getContentAsString(), WorkItemResponse.class);
+
+        // Verify an outbox event was recorded in the database in the same transaction
+        long outboxCountAfter = outboxEventRepository.count();
+        assertThat(outboxCountAfter).isGreaterThan(outboxCountBefore);
+
+        // Run the OutboxProcessor
+        int processedCount = outboxProcessor.processPendingEvents(20);
+        assertThat(processedCount).isGreaterThan(0);
+
+        // Verify outbox event is now marked PROCESSED
+        boolean existsPending = outboxEventRepository.existsByAggregateTypeAndAggregateIdAndEventTypeAndStatus(
+                "WORK_ITEM", created.id(), "ITEM_CREATED", com.newtonite.ops.model.OutboxStatus.PENDING);
+        assertThat(existsPending).isFalse();
     }
 }

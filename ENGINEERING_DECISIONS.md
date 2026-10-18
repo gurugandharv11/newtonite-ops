@@ -2,150 +2,155 @@
 
 ## Project: Operations Under Pressure (Newtonite Work Management Platform)
 
-This document explains five critical architectural and engineering decisions implemented in this system, including the context, evaluated alternatives, chosen solution, trade-offs, and production considerations.
+This document provides a thorough analysis of the architectural decisions, concurrency models, failure modes, trade-offs, and scaling considerations implemented in this enterprise operational platform.
 
 ---
 
-### Decision 1: Relational Data Model & Append-Only Activity Audit History
+## 1. System Request-Flow Architecture
 
-#### Context and Problem
-An operational system running in high-stress enterprise environments requires an immutable audit record for every action. Operators and auditors must know:
-- Who transitioned an incident or claimed a task?
-- What was the exact prior state and new state?
-- Why was a decision made?
-- If an update fails, how do we guarantee that false audit logs are never persisted?
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Operator as Triage Operator / Lead
+    participant Frontend as React (Vite + TanStack Query)
+    participant Auth as Spring Security & JWT Filter
+    participant Service as WorkItemService / WorkflowService
+    participant OCC as Optimistic Locking & Atomic Query
+    participant Database as MySQL / H2 Relational DB
+    participant Outbox as Transactional Outbox Engine
+    participant Dispatcher as Async Notification Worker
 
-#### Options Considered
-1. **Event Sourcing (Pure CQRS/ES)**: Store only events and rehydrate state on read.
-   - *Downside*: Excessive complexity, high query overhead for complex multi-field filtering and relational foreign key constraints.
-2. **Entity-level update without audit history**: Update records in-place without tracking granular deltas.
-   - *Downside*: Violates auditability, accountability, and compliance requirements.
-3. **Normalized Relational Model with Synchronous Append-Only Activity Events**: Use normalized relational entities (`users`, `teams`, `work_items`, `comments`) with an append-only `activity_events` ledger executed within the exact same database transaction boundary.
+    Operator->>Frontend: Perform Action (Create / Claim / Transition / Update)
+    Frontend->>Auth: HTTP Request + Bearer JWT + Idempotency-Key
+    Auth->>Auth: Validate JWT & Populate UserPrincipal (Roles per Team)
+    Auth->>Service: Dispatch Request with Authenticated Context
+    Service->>Service: Enforce Team-Scoped Authorization & State Machine Rules
+    alt Idempotent Creation
+        Service->>Database: Query Idempotency Record (Scoped to User ID)
+        Database-->>Service: Return Cached Response (if matching hash)
+    else Atomic Claim / OCC Update
+        Service->>OCC: Execute Atomic Update / Verify Version Match
+        OCC->>Database: Atomic SQL Statement or JPA Flush
+        Database-->>OCC: Check updated rows / version
+    end
+    Service->>Database: Commit Work Item + Activity Event + Outbox Event (Atomic ACID Transaction)
+    Database-->>Frontend: HTTP 200 / 201 Response (or 409 Conflict)
+    Frontend-->>Operator: Update UI State / Show Confirmation or Conflict Modal
 
-#### Chosen Approach
-We chose **Option 3**. Every mutating operation (`create`, `update`, `claim`, `transition`, `comment`) writes an immutable row into `activity_events` with the actor, action type, old value, new value, and structured note.
-
-#### Why Selected
-- Guarantees complete ACID consistency: if the business update fails or throws an exception, Spring's `@Transactional` boundary automatically rolls back both the entity change and the activity event.
-- Immutable append-only design prevents non-admin users from altering history.
-- Indexed by `(work_item_id, created_at DESC)` for high-throughput pagination.
-
-#### Trade-offs & Limitations
-- Event table size grows linearly with activity volume.
-- In enterprise production environments with tens of millions of records, older activity logs would eventually require cold storage tiering (e.g., partitioning by year or archiving to Parquet/S3).
+    Note over Outbox,Dispatcher: Asynchronous Processing (Decoupled from User Latency)
+    Outbox->>Database: Poll PENDING outbox events with batch limit
+    Outbox->>Dispatcher: Dispatch notification (Webhook / Slack / Email)
+    alt Success
+        Dispatcher->>Database: Mark status = PROCESSED with timestamp
+    else Transport Failure
+        Dispatcher->>Database: Increment retry_count; schedule backoff; set FAILED after max retries
+    end
+```
 
 ---
 
-### Decision 2: Optimistic Concurrency Control (OCC) & Atomic Claiming
+## 2. Core Architectural Decisions & Trade-Offs
 
-#### Context and Problem
-In fast-paced operations, multiple operators frequently view and attempt to triage the same unassigned urgent incidents simultaneously. Two critical concurrency vulnerabilities exist:
-1. **Lost Update Problem**: Operator A and Operator B open the same item; Operator A saves first, Operator B saves second, unintentionally overwriting Operator A's work without knowing it changed.
-2. **Race Condition on Claims**: Two operators click "Claim" on an unassigned incident at the exact same millisecond. An unsafe read-then-write sequence would allow both to believe they won the claim.
+### Decision 1: Relational Data Model & Append-Only Activity Audit Ledger
+- **Context & Problem**: In mission-critical incident response, accountability requires knowing who touched an item, when, why, and what fields changed.
+- **Alternatives Evaluated**:
+  1. *Event Sourcing (CQRS/ES)*: High complexity, complicates ad-hoc search across multiple relational filters.
+  2. *In-place updates without audit*: Violates compliance and operational traceability.
+  3. *Relational tables with synchronous append-only activity ledger*: Normalized core entities (`users`, `teams`, `work_items`, `comments`) with an append-only `activity_events` table written in the same transaction.
+- **Chosen Approach**: Option 3. Mutating operations record structured events (`CREATED`, `ASSIGNED`, `REASSIGNED`, `STATUS_TRANSITIONED`, `APPROVAL_REQUESTED`, `APPROVED`, `COMMENT_ADDED`) in the exact same database commit.
+- **Trade-offs**: Activity table grows monotonically. At 10x scale, older closed incident logs should be archived to columnar storage (e.g. Parquet on S3 / ClickHouse).
 
-#### Options Considered
-1. **Pessimistic Locking (`SELECT FOR UPDATE`)**: Lock the database row upon read.
-   - *Downside*: Causes database connection pool exhaustion, blocking reads across teams, and deadlock vulnerability under high concurrency.
-2. **Standard `@Version` Hibernate entity field alone without explicit claim logic**: Rely entirely on JPA versioning.
-   - *Downside*: Standard versioning throws an unhandled optimistic lock exception on flush and does not provide an atomic winner/loser contract for claiming.
-3. **Hybrid OCC (`@Version`) + Single-Statement Atomic Claim (`UPDATE ... WHERE assignee_id IS NULL`)**:
-   - Updates submit their known `version` in the payload; mismatches immediately yield `409 Conflict`.
-   - Claims execute a single atomic SQL statement:
+---
+
+### Decision 2: Hybrid Concurrency Control: Optimistic Locking + Single-Statement Atomic Claiming
+- **Context & Problem**: Multiple triage engineers viewing unassigned urgent incidents may attempt to claim or edit them simultaneously.
+- **Mechanisms Implemented**:
+  1. **Optimistic Concurrency Control (OCC)**: Work items contain a `@Version Long version` attribute. Clients pass the known `version` on updates and transitions. Mismatches abort immediately with `409 Conflict`, accompanied by the current entity version so the client can reconcile state.
+  2. **Single-Statement Atomic Claim**: To prevent race conditions during claim bursts, claiming executes a single database statement:
      ```sql
-     UPDATE work_items SET assignee_id = :userId, version = version + 1, updated_at = :now
-     WHERE id = :itemId AND assignee_id IS NULL
+     UPDATE work_items 
+     SET assignee_id = :userId, version = version + 1, updated_at = :now 
+     WHERE id = :itemId AND assignee_id IS NULL;
      ```
-
-#### Chosen Approach
-We implemented **Option 3**.
-- Updates compare the client's version against the persistence version. If stale, the transaction aborts and returns an explicit `409 Conflict` containing the exact conflicting version. The frontend displays a conflict modal prompting the user to reload the latest server state without losing data.
-- Claims execute atomically at the database engine level. The database row lock is held for microseconds only during statement execution. Exactly one transaction updates 1 row; the concurrent transaction updates 0 rows and immediately receives `409 Conflict`.
-
-#### Automated Verification
-Verified by automated integration test `testConcurrentClaims` using a Java `CyclicBarrier` with concurrent threads asserting that exactly 1 wins and 1 loses with HTTP 409.
+     The row lock is held at the database engine level only for the microsecond duration of this statement. If zero rows are modified, a concurrent operator claimed it first, returning an explicit `409 Conflict`.
+  3. **Same-User Claim Idempotency**: If the same user retries claiming an item they already hold, the system detects this and returns the current state with `200 OK` without recording duplicate activity events.
 
 ---
 
-### Decision 3: Multi-Team Scoped Authorization & Segregation of Duties
-
-#### Context and Problem
-Users belong to multiple teams with different responsibilities. A user might be a `LEAD` in Core Platform, a `MEMBER` in Regulatory Compliance, and have no access to Payment Investigations.
-Furthermore, regulatory requirements demand **Segregation of Duties**: an operator should not approve their own change request merely because they can edit it.
-
-#### Options Considered
-1. **Global Role-Based Access Control (RBAC)**: Assign static system-wide roles (e.g. `ROLE_ADMIN`, `ROLE_USER`).
-   - *Downside*: Fails completely in multi-team enterprise organizations where permissions are team-scoped.
-2. **Ad-hoc `@PreAuthorize` SpEL checks in individual controller methods**:
-   - *Downside*: High risk of developer oversight, code duplication, and inconsistent security boundaries.
-3. **Centralized `AuthorizationService` with Multi-Tenant Team Scoping**:
-   - Team memberships and roles (`VIEWER`, `MEMBER`, `LEAD`, `ADMIN`) are loaded into the authenticated `UserPrincipal`.
-   - A single, centralized `AuthorizationService` policy layer verifies membership on all reads, mutations, reassignments, and state transitions.
-
-#### Chosen Approach & Role Hierarchy
-We chose **Option 3**:
-- `VIEWER`: Can view work items and activity timelines for their authorized teams.
-- `MEMBER`: Inherits `VIEWER` rights; can create items, claim unassigned items, edit item details, post comments, and request approvals.
-- `LEAD`: Inherits `MEMBER` rights; possesses exclusive authorization to approve items transitioning from `AWAITING_APPROVAL` to `RESOLVED`, and reassign items between operators.
-- `ADMIN`: Global administration; possesses audit-level visibility across all teams and can reopen closed items.
-
-#### Segregation of Duties Rule
-In `WorkflowService.java`, even if a user has `LEAD` authority in a team, they cannot approve an item where they are currently the assignee (preventing self-approval), unless acting as explicit Global Administrator.
+### Decision 3: Multi-Tenant Team-Scoped Authorization & Segregation of Duties
+- **Context & Problem**: Users participate in multiple teams with varying responsibilities (e.g., Lead in Core Ops, Viewer in Compliance). Segregation of duties mandates that an engineer cannot approve their own change requests.
+- **Mechanisms Implemented**:
+  1. **Role Hierarchy**: `VIEWER` (read-only) &lt; `MEMBER` (create, claim, edit, transition to review) &lt; `LEAD` (approve, reassign) &lt; `ADMIN` (global cross-team visibility, closed item reopening).
+  2. **Centralized Policy Service**: `AuthorizationService` encapsulates all permission evaluation, eliminating duplicated `@PreAuthorize` annotations across controllers.
+  3. **Strict Segregation of Duties**: In `WorkflowService`, approving an item transitioning from `AWAITING_APPROVAL` to `RESOLVED` requires `LEAD` role, and explicitly forbids approval if the user is either the **current assignee** or the **original creator**, unless acting as Global Administrator.
 
 ---
 
-### Decision 4: Persistent Idempotency with Request Payload Hashes
-
-#### Context and Problem
-Network timeouts, packet loss, and double-clicks by anxious operators can result in duplicate incident tickets or double billing investigation entries. The system must guarantee that retrying an identical request with an `Idempotency-Key` header produces the exact same response without creating duplicates. Conversely, malicious or erroneous reuse of the same key with different payloads must be rejected.
-
-#### Options Considered
-1. **Client-side button disabling only**:
-   - *Downside*: Useless against network retries, script loops, or automated webhook replays.
-2. **Ephemeral in-memory cache (e.g., Redis or ConcurrentHashMap)**:
-   - *Downside*: Cache eviction or node restarts lose idempotency records, creating duplicate records on retry.
-3. **Persistent Relational `IdempotencyRecord` with SHA-256 Request Hashing**:
-   - Store `idempotency_key` (unique constraint), `request_hash`, `response_status`, and `response_body` in MySQL.
-
-#### Chosen Approach
-We implemented **Option 3**:
-1. When a client submits a `POST /api/items` with `Idempotency-Key`, the server computes the SHA-256 hash of the normalized request payload.
-2. It queries `idempotency_records` within the active transaction.
-3. If found:
-   - If `request_hash` matches: Return the cached response with original HTTP status.
-   - If `request_hash` differs: Reject immediately with `409 Conflict` (idempotency key reuse violation).
-4. If not found: The item is created, audit logs recorded, and the idempotency record saved in the same database commit.
-
-#### Automated Verification
-Verified by automated integration test `testIdempotentWorkItemCreation`, asserting that submitting the same key twice creates exactly 1 database row and replays the response.
+### Decision 4: Persistent Idempotency Engine Scoped by Authenticated User
+- **Context & Problem**: Flaky mobile networks or operator retries can lead to duplicate incident tickets or chargeback investigations.
+- **Mechanisms Implemented**:
+  1. The client supplies an `Idempotency-Key` header.
+  2. The server scopes the key to the authenticated user namespace: `u:{userId}:{rawKey}`. This prevents malicious or accidental key collision between different users.
+  3. The request payload is hashed using SHA-256.
+  4. If the key exists:
+     - Matching hash: replays the original response with identical status and headers.
+     - Mismatched hash: returns `409 Conflict` (key reuse with mutated payload).
+  5. The idempotency record is persisted using `saveAndFlush` within the same transaction. Race attempts with identical keys fail on unique constraint and return `409 Conflict` rather than an unhandled 500 error.
 
 ---
 
-### Decision 5: Server-Side Query Scoping, Indexing, and Pagination
-
-#### Context and Problem
-Work management systems accumulate hundreds of thousands of work items. Fetching full lists to the client degrades browser memory, creates huge database I/O spikes, and leaks cross-team data.
-
-#### Options Considered
-1. **Client-side filtering**: Fetch all items and filter in React.
-   - *Downside*: Serious security leak, poor performance on large datasets.
-2. **Offset-limit pagination without authorization scoping**:
-   - *Downside*: Exposes items outside the user's teams.
-3. **Specification-Driven Server-Side Filtering with Index Alignment & Scoping**:
-   - Build dynamic JPA Specifications that inject `team_id IN (authorizedTeamIds)` directly into the SQL `WHERE` clause.
-   - Enforce bounded page sizes (maximum 100 items per request).
-   - Align indexes with actual query patterns:
-     - `idx_wi_team_status (team_id, status)`
-     - `idx_wi_assignee_status (assignee_id, status)`
-     - `idx_wi_priority (priority)`
-     - `idx_wi_due_date (due_date)`
-     - `idx_wi_updated_at (updated_at)`
-
-#### Chosen Approach
-We implemented **Option 3**. Dashboard summaries and list views calculate counts and retrieve paginated pages entirely within SQL, leveraging composite B-tree indexes to maintain sub-50ms latency regardless of dataset volume.
+### Decision 5: Synchronous vs. Asynchronous Processing & Transactional Outbox Pattern
+- **Context & Problem**: Sending email, Slack, or webhook notifications synchronously in the HTTP request thread introduces external latency, risks distributed partial failures, and could roll back a successful database write if the external notifier times out.
+- **Trade-off Analysis**:
+  - *Direct Synchronous Notification*: Adds 200ms–2000ms latency to user request; external outage causes user operation to fail.
+  - *In-Memory `@Async`*: If the JVM restarts before dispatch, notification events are lost forever.
+  - *Full Message Broker (Kafka/RabbitMQ)*: High operational overhead, violates assessment guidance to avoid unnecessary infrastructure.
+- **Chosen Approach**: **Transactional Outbox Pattern**.
+  - In the same database transaction that updates the work item and activity log, an `outbox_events` record is written with status `PENDING`.
+  - An asynchronous `OutboxProcessor` polls pending events, delegates dispatch to `NotificationDispatcher`, updates status to `PROCESSED`, and handles retries with backoff up to `maxRetries` (3) before marking `FAILED`.
+  - Guarantees at-least-once delivery with zero risk of database/event inconsistency.
 
 ---
 
-### Summary of Engineering Principles Applied
-1. **Correctness over Complexity**: No extraneous distributed message queues or Redis caches were added when relational ACID transactions and indexes natively provide rock-solid reliability.
-2. **Fail Fast with Clear Contracts**: Centralized exception handler maps errors directly to standardized `ApiErrorResponse` structures (HTTP 400, 401, 403, 404, 409).
-3. **Zero Secrets in Code**: All signing keys and credentials are bound to environment variables with fallback defaults for zero-friction local testing.
+## 3. Comprehensive Failure Scenarios & Recovery Matrix
+
+| Failure Scenario | Trigger | Detection Mechanism | System Behavior & Recovery | Client Impact |
+|---|---|---|---|---|
+| **Duplicate Request (Same Payload)** | Network timeout causing client retry with same `Idempotency-Key` | User-scoped lookup in `idempotency_records` matches SHA-256 hash | Replays cached response body without duplicate database insert or activity event | Clean `201 Created` / `200 OK`; idempotent |
+| **Idempotency Key Reuse (Different Payload)** | Erroneous client reusing key for distinct operation | Hash mismatch against stored `request_hash` | Transaction aborted; no database mutation | `409 Conflict` with clear error description |
+| **Concurrent Same-Key Race** | Two threads submit identical key simultaneously | Database unique constraint on `idempotency_key` | First thread succeeds; second caught by `GlobalExceptionHandler` | Thread 1 gets `201 Created`; Thread 2 receives `409 Conflict` |
+| **Concurrent Item Claim Race** | Multiple operators click "Claim" simultaneously | Single-statement `atomicClaim` checks `assignee IS NULL` | Exactly 1 winner updates 1 row; loser updates 0 rows and aborts | Winner gets `200 OK` + assigned item; Loser receives `409 Conflict` ("Claim conflict") |
+| **Same-User Claim Double-Click** | Operator double-clicks claim button | `WorkItemService` detects item is already assigned to current user | Short-circuits without error or duplicate activity event | Returns current item with `200 OK` |
+| **Stale Update (Lost Update Problem)** | Operator A submits edit while Operator B saved in interim | Version comparison `item.getVersion() != request.version()` | Transaction aborted; no fields overwritten | `409 Conflict` returned; UI displays conflict banner with one-click reload |
+| **Cross-Team Access Attempt** | User attempts to read or mutate another team's private item | `AuthorizationService.checkRoleInTeam` fails | Blocked before query execution or mutation | `403 Forbidden` with "Access denied" |
+| **Prohibited Self-Approval** | Assignee or Creator attempts to approve own request | `WorkflowService` evaluates `assigneeId == userId \|\| creatorId == userId` | Blocked by state machine validation | `403 Forbidden` ("Segregation of duties violation") |
+| **External Notification Outage** | Email / Webhook service unavailable or timing out | `NotificationDispatcher` throws exception | `OutboxProcessor` catches error, increments `retry_count`, leaves `PENDING` | Zero user disruption; background retry up to 3 times before marking `FAILED` |
+| **Unauthenticated Request** | Expired or missing Bearer JWT | `JwtAuthenticationFilter` validates signature & expiry | Security filter chain rejects request | `401 Unauthorized` |
+
+---
+
+## 4. Assumptions & Explicit Non-Goals
+
+### Assumptions
+1. **User Identity Provisioning**: Demo accounts are provisioned via database seed migrations. Public self-registration is intentionally omitted as this is an internal enterprise platform.
+2. **Clock Synchronization**: Nodes are assumed to run synchronized system clocks (via NTP) for token expiration and OCC timestamp validity.
+3. **Database Capabilities**: Relational database supports atomic single-row updates and transactions (MySQL 8.0 InnoDB or H2 in MySQL mode).
+
+### Explicit Non-Goals
+1. **No External Message Brokers**: RabbitMQ, Kafka, or Redis were intentionally omitted to avoid operational infrastructure bloat, satisfying requirements using relational ACID transactions and the Transactional Outbox Pattern.
+2. **Stateless Token Blacklisting**: JWT tokens are stateless. Client-side logout discards the stored token. Complete server-side token revocation prior to expiry without a distributed cache is an explicit non-goal for this phase.
+
+---
+
+## 5. Scaling Roadmap: One More Week & 10x Scale
+
+### What I Would Improve With One More Week
+1. **WebSocket / SSE Live Updates**: Implement Server-Sent Events to push item transitions and new comments to active operator browser tabs in real time.
+2. **Distributed Token Revocation**: Add a low-latency Redis cache for instantaneous JWT token blacklisting upon logout or password reset.
+3. **Draft Work Items**: Introduce draft saving with local storage backup so operators do not lose detailed incident investigation notes during network dropouts.
+4. **Rich SLA Deadlines**: Add automated escalation warnings when urgent incidents remain unassigned for more than 15 minutes.
+
+### Architectural Evolution at 10x Scale (100,000+ Daily Incidents)
+1. **Read/Write Replica Splitting**: Direct dashboard aggregation queries and list filtering to MySQL read replicas using Spring Data RoutingDataSource, reserving the primary instance for mutations.
+2. **Activity Ledger Partitioning**: Partition `activity_events` and `outbox_events` tables by year/month, archiving closed items older than 90 days to AWS S3 / Parquet queried via Athena or ClickHouse.
+3. **Dedicated Outbox Worker Pods**: Decouple `OutboxProcessor` into a dedicated background worker container using Kubernetes Horizontal Pod Autoscalers to handle notification bursts without consuming web tier memory.
