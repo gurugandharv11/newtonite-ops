@@ -65,8 +65,11 @@ public class GlobalExceptionHandler {
                 .body(new ApiErrorResponse("VALIDATION_ERROR", details, HttpStatus.BAD_REQUEST.value()));
     }
 
+    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(GlobalExceptionHandler.class);
+
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ApiErrorResponse> handleGeneral(Exception ex) {
+        log.error("Unhandled exception processing request: {}", ex.getMessage(), ex);
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                 .body(new ApiErrorResponse("INTERNAL_SERVER_ERROR", "An unexpected server error occurred.", HttpStatus.INTERNAL_SERVER_ERROR.value()));
     }

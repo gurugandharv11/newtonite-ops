@@ -633,4 +633,48 @@ public class NewtoniteOpsIntegrationTests {
                 "WORK_ITEM", created.id(), "ITEM_CREATED", com.newtonite.ops.model.OutboxStatus.PENDING);
         assertThat(existsPending).isFalse();
     }
+
+    // TEST 19: Comprehensive Authentication Verification for Alex.Member & Edge Cases
+    @Test
+    @DisplayName("19. Authentication: alex.member sign in, whitespace trimming, case insensitivity, and invalid credentials")
+    void testAuthenticationFlows() throws Exception {
+        // Standard alex.member login
+        LoginRequest validReq = new LoginRequest("alex.member", "password123");
+        MvcResult res = mockMvc.perform(post("/api/auth/login")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(validReq)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.token").isString())
+                .andExpect(jsonPath("$.user.username").value("alex.member"))
+                .andExpect(jsonPath("$.teamRoles.1").value("MEMBER"))
+                .andReturn();
+        AuthResponse auth = objectMapper.readValue(res.getResponse().getContentAsString(), AuthResponse.class);
+        assertThat(auth.token()).isNotBlank();
+
+        // Case-insensitivity & whitespace trimming
+        LoginRequest trimmedReq = new LoginRequest("  ALEX.MEMBER  ", "password123");
+        mockMvc.perform(post("/api/auth/login")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(trimmedReq)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.user.username").value("alex.member"));
+
+        // Bad password -> 401 INVALID_CREDENTIALS
+        LoginRequest badPassReq = new LoginRequest("alex.member", "wrongpassword");
+        mockMvc.perform(post("/api/auth/login")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(badPassReq)))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.code").value("INVALID_CREDENTIALS"))
+                .andExpect(jsonPath("$.message").value("Invalid username or password"));
+
+        // Unknown user -> 401 INVALID_CREDENTIALS
+        LoginRequest unknownUserReq = new LoginRequest("nonexistent.user", "password123");
+        mockMvc.perform(post("/api/auth/login")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(unknownUserReq)))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.code").value("INVALID_CREDENTIALS"))
+                .andExpect(jsonPath("$.message").value("Invalid username or password"));
+    }
 }

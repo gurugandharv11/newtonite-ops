@@ -29,8 +29,9 @@ public class CustomUserDetailsService implements UserDetailsService {
     @Override
     @Transactional(readOnly = true)
     public UserDetails loadUserByUsername(String username) throws UsernameNotFoundException {
-        User user = userRepository.findByUsername(username)
-                .orElseThrow(() -> new UsernameNotFoundException("User not found: " + username));
+        String cleanUsername = username != null ? username.trim() : "";
+        User user = userRepository.findByUsernameIgnoreCase(cleanUsername)
+                .orElseThrow(() -> new UsernameNotFoundException("User not found: " + cleanUsername));
 
         List<TeamMembership> memberships = teamMembershipRepository.findByUserIdWithTeam(user.getId());
         Map<Long, TeamRole> teamRoles = new HashMap<>();
