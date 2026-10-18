@@ -17,10 +17,16 @@ export const LoginPage: React.FC = () => {
     setError(null);
     setIsLoading(true);
     try {
-      await login(username, password);
+      await login(username.trim(), password);
       navigate('/');
     } catch (err: any) {
-      setError(err.response?.data?.message || 'Invalid username or password');
+      if (!err.response) {
+        setError('Cannot connect to backend server. Please verify the backend is running on port 8080.');
+      } else if (err.response.status === 401) {
+        setError(err.response.data?.message || 'Invalid username or password');
+      } else {
+        setError(err.response.data?.message || `Server error (${err.response.status}). Please try again later.`);
+      }
     } finally {
       setIsLoading(false);
     }
