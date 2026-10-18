@@ -4,6 +4,8 @@ Operational work management platform for multi-team internal environments to tri
 
 Design decisions, alternatives, and trade-offs are documented in [ENGINEERING_DECISIONS.md](ENGINEERING_DECISIONS.md) (covers OCC versioning, atomic claims, idempotency, transactional outbox, and role scoping). Requirements matrix is in [REQUIREMENTS_AUDIT.md](REQUIREMENTS_AUDIT.md).
 
+> **Live Demo Deployment**: [https://newtonite-ops-gamma.vercel.app](https://newtonite-ops-gamma.vercel.app) *(Demo accounts: `sarah.lead` / `alex.member` — Password: `password123`)*
+
 ---
 
 ## 1. System Architecture & Request Flow
@@ -57,6 +59,8 @@ cd backend && mvn spring-boot:run
 Backend runs at `http://localhost:8080`.
 
 ### Step 3: Frontend Startup
+- **Production Deployment**: [https://newtonite-ops-gamma.vercel.app](https://newtonite-ops-gamma.vercel.app)
+- **Local Development**:
 ```bash
 cd frontend && npm install && npm run dev
 ```
